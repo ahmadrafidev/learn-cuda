@@ -1,61 +1,123 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
+#include <math.h>
 
-__global__ void jacobiKernel(float *A, float *b, float *x, float *x_new, int N) {
+#define N 16 // ukuran matriks lebih kecil untuk debugging
+#define MAX_ITER 1000 // jumlah iterasi maksimum
+#define TOLERANCE 1e-6 // toleransi konvergensi
+
+__global__ void jacobiIterationKernel(float *A, float *b, float *x, float *x_new, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        float sigma = 0.0f;
-        for (int j = 0; j < N; j++) {
+    if (idx < n) {
+        float sigma = 0.0;
+        for (int j = 0; j < n; j++) {
             if (j != idx) {
-                sigma += A[idx * N + j] * x[j];
+                sigma += A[idx * n + j] * x[j];
             }
         }
-        x_new[idx] = (b[idx] - sigma) / A[idx * N + idx];
+        if (A[idx * n + idx] != 0) {
+            x_new[idx] = (b[idx] - sigma) / A[idx * n + idx];
+        } else {
+            x_new[idx] = x[idx]; // Hindari pembagian dengan nol
+        }
     }
 }
 
-void jacobiSolver(float *A, float *b, float *x, int N, int maxIterations, float tolerance) {
+void checkCudaError(cudaError_t err, const char* msg) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: %s: %s\n", msg, cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+}
+
+bool checkConvergence(float *x, float *x_new, int n, float tolerance) {
+    for (int i = 0; i < n; i++) {
+        if (fabs(x[i] - x_new[i]) > tolerance) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void jacobiIteration(float *A, float *b, float *x, int n) {
     float *d_A, *d_b, *d_x, *d_x_new;
-    size_t size = N * sizeof(float);
-    size_t sizeA = N * N * sizeof(float);
+    size_t size = n * n * sizeof(float);
+    cudaError_t err;
 
-    cudaMalloc(&d_A, sizeA);
-    cudaMalloc(&d_b, size);
-    cudaMalloc(&d_x, size);
-    cudaMalloc(&d_x_new, size);
+    err = cudaMalloc(&d_A, size);
+    checkCudaError(err, "Failed to allocate device memory for A");
 
-    cudaMemcpy(d_A, A, sizeA, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b, b, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_x, x, size, cudaMemcpyHostToDevice);
+    err = cudaMalloc(&d_b, n * sizeof(float));
+    checkCudaError(err, "Failed to allocate device memory for b");
 
-    int blockSize = 256;
-    int numBlocks = (N + blockSize - 1) / blockSize;
+    err = cudaMalloc(&d_x, n * sizeof(float));
+    checkCudaError(err, "Failed to allocate device memory for x");
 
-    for (int iter = 0; iter < maxIterations; iter++) {
-        jacobiKernel<<<numBlocks, blockSize>>>(d_A, d_b, d_x, d_x_new, N);
-        cudaDeviceSynchronize();
+    err = cudaMalloc(&d_x_new, n * sizeof(float));
+    checkCudaError(err, "Failed to allocate device memory for x_new");
 
-        // Check for convergence (not optimized for performance)
-        float maxError = 0.0f;
-        cudaMemcpy(x, d_x_new, size, cudaMemcpyDeviceToHost);
-        for (int i = 0; i < N; i++) {
-            float error = fabs(x[i] - d_x[i]);
-            if (error > maxError) {
-                maxError = error;
+    err = cudaMemcpy(d_A, A, size, cudaMemcpyHostToDevice);
+    checkCudaError(err, "Failed to copy matrix A to device");
+
+    err = cudaMemcpy(d_b, b, n * sizeof(float), cudaMemcpyHostToDevice);
+    checkCudaError(err, "Failed to copy vector b to device");
+
+    err = cudaMemcpy(d_x, x, n * sizeof(float), cudaMemcpyHostToDevice);
+    checkCudaError(err, "Failed to copy vector x to device");
+
+    dim3 blockSize(256);
+    dim3 gridSize((n + blockSize.x - 1) / blockSize.x);
+
+    float *h_x_new = (float *)malloc(n * sizeof(float));
+
+    for (int iter = 0; iter < MAX_ITER; iter++) {
+        jacobiIterationKernel<<<gridSize, blockSize>>>(d_A, d_b, d_x, d_x_new, n);
+        err = cudaGetLastError();
+        checkCudaError(err, "Kernel execution failed");
+
+        err = cudaMemcpy(h_x_new, d_x_new, n * sizeof(float), cudaMemcpyDeviceToHost);
+        checkCudaError(err, "Failed to copy result x_new to host");
+
+        // Print values for debugging
+        printf("Iteration %d: ", iter);
+        for (int i = 0; i < n; i++) {
+            printf("%f ", h_x_new[i]);
+        }
+        printf("\n");
+
+        // Check for NaN or Inf
+        for (int i = 0; i < n; i++) {
+            if (isnan(h_x_new[i]) || isinf(h_x_new[i])) {
+                printf("NaN or Inf detected at index %d\n", i);
+                free(h_x_new);
+                cudaFree(d_A);
+                cudaFree(d_b);
+                cudaFree(d_x);
+                cudaFree(d_x_new);
+                return; // Stop execution
             }
         }
-        if (maxError < tolerance) {
+
+        // Check convergence
+        if (checkConvergence(x, h_x_new, n, TOLERANCE)) {
+            printf("Converged at iteration %d\n", iter);
             break;
         }
 
-        // Swap pointers
-        float *temp = d_x;
-        d_x = d_x_new;
-        d_x_new = temp;
+        // Copy new values to x for next iteration
+        err = cudaMemcpy(d_x, d_x_new, n * sizeof(float), cudaMemcpyDeviceToDevice);
+        checkCudaError(err, "Failed to copy x_new to x on device");
+
+        // Update host x for next iteration
+        for (int i = 0; i < n; i++) {
+            x[i] = h_x_new[i];
+        }
     }
 
-    cudaMemcpy(x, d_x, size, cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(x, d_x_new, n * sizeof(float), cudaMemcpyDeviceToHost);
+    checkCudaError(err, "Failed to copy final result x to host");
 
+    free(h_x_new);
     cudaFree(d_A);
     cudaFree(d_b);
     cudaFree(d_x);
@@ -63,34 +125,60 @@ void jacobiSolver(float *A, float *b, float *x, int N, int maxIterations, float 
 }
 
 int main() {
-    int N = 1024; // Adjust as necessary
-    int maxIterations = 10000;
-    float tolerance = 1e-6;
+    float A[N * N];
+    float b[N];
+    float x[N];
 
-    float *A = (float*)malloc(N * N * sizeof(float));
-    float *b = (float*)malloc(N * sizeof(float));
-    float *x = (float*)malloc(N * sizeof(float));
-
-    // Initialize A, b, and x (example initialization)
+    // Inisialisasi matriks A dan vektor b
+    // Pastikan elemen diagonal A cukup besar untuk stabilitas numerik
     for (int i = 0; i < N; i++) {
-        b[i] = i;
-        x[i] = 0.0f;
+        b[i] = (float)(i + 1); // Nilai yang lebih beragam untuk b
+        x[i] = 0.0; // Inisialisasi dengan nilai nol
         for (int j = 0; j < N; j++) {
-            A[i * N + j] = (i == j) ? 2.0f : 1.0f; // Example values
+            if (i == j) {
+                A[i * N + j] = 10.0; // Diagonal dominan yang lebih besar
+            } else {
+                A[i * N + j] = 0.1; // Nilai lebih kecil untuk elemen non-diagonal
+            }
         }
     }
 
-    jacobiSolver(A, b, x, N, maxIterations, tolerance);
-
-    // Print the solution
+    // Validasi elemen-elemen matriks dan vektor sebelum transfer ke device
     for (int i = 0; i < N; i++) {
-        printf("%f ", x[i]);
+        if (isnan(b[i]) || isinf(b[i])) {
+            printf("NaN or Inf found in b at index %d\n", i);
+            return -1;
+        }
+        for (int j = 0; j < N; j++) {
+            if (isnan(A[i * N + j]) || isinf(A[i * N + j])) {
+                printf("NaN or Inf found in A at index %d, %d\n", i, j);
+                return -1;
+            }
+        }
+    }
+
+    // Cetak beberapa elemen untuk debugging
+    printf("Beberapa elemen matriks A:\n");
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < N; j++) {
+            printf("%f ", A[i * N + j]);
+        }
+        printf("\n");
+    }
+
+    printf("Beberapa elemen vektor b:\n");
+    for (int i = 0; i < N; i++) {
+        printf("%f ", b[i]);
     }
     printf("\n");
 
-    free(A);
-    free(b);
-    free(x);
+    jacobiIteration(A, b, x, N);
+
+    // Cetak hasil x
+    printf("Hasil vektor x:\n");
+    for (int i = 0; i < N; i++) {
+        printf("%f\n", x[i]);
+    }
 
     return 0;
 }
